@@ -1,2 +1,1 @@
 # Sahelanthropus
-# Sahelanthropus
