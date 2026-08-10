@@ -1,0 +1,54 @@
+# === Build artifacts ===
+cycle_counter.so
+*.o
+*.pyc
+__pycache__/
+
+# === QEMU ===
+qemu/
+qemu-src.tar.xz
+*.core
+qemu_code.elf_*
+
+# === AnghaBench dataset ===
+AnghaBench/
+anghabench_*.json
+anghabench_full_precomputed_baselines.json
+
+# === Corpus & precomputed data ===
+corpus.json
+anghabench_10k_corpus.json
+
+# === Training outputs / diagnostics ===
+learning_curve.csv
+learning_curve.json
+ppo_100k_learning_curve.csv
+ppo_100k_learning_curve.json
+diagnostic_*.json
+diagnostics_*.json
+losses_*.json
+measurements/
+reports/
+runs/
+
+# === CoreMark build artifacts ===
+coremark/*.o
+coremark/*.s
+coremark/*.exe
+coremark/*.md5
+coremark/coremark.dump
+
+# === LLVM pass build ===
+llvm-pass-skeleton/build/
+llvm-pass-skeleton/blocks.json
+
+# === Python ===
+*.pyc
+__pycache__/
+*.egg-info/
+.venv/
+venv/
+
+# === Misc ===
+*.bak
+*.dump
