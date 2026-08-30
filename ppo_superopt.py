@@ -48,8 +48,16 @@ class ActorCritic(nn.Module):
         self.num_rules = num_rules
         self.max_len = max_len
 
-        # Shared Feature Extractor Trunk
-        self.trunk = nn.Sequential(
+        # Separate Actor Trunk (prevents critic gradient corruption)
+        self.actor_trunk = nn.Sequential(
+            nn.Linear(obs_dim, 256),
+            nn.Tanh(),
+            nn.Linear(256, 256),
+            nn.Tanh()
+        )
+
+        # Separate Critic Trunk
+        self.critic_trunk = nn.Sequential(
             nn.Linear(obs_dim, 256),
             nn.Tanh(),
             nn.Linear(256, 256),
@@ -63,7 +71,7 @@ class ActorCritic(nn.Module):
         self.critic = nn.Linear(256, 1)
 
     def get_value(self, obs: torch.Tensor) -> torch.Tensor:
-        features = self.trunk(obs)
+        features = self.critic_trunk(obs)
         return self.critic(features).squeeze(-1)
 
     def get_action_and_value(
@@ -72,13 +80,12 @@ class ActorCritic(nn.Module):
         action_mask: Optional[torch.Tensor] = None,
         action: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        features = self.trunk(obs)
-        logits = self.actor(features)
+        actor_features = self.actor_trunk(obs)
+        logits = self.actor(actor_features)
 
-        # Apply Action Masking if provided
+        # Apply Action Masking: mask is already shape (batch, 160) — no expansion needed
         if action_mask is not None:
-            expanded_mask = action_mask.repeat_interleave(self.max_len, dim=-1)
-            logits = torch.where(expanded_mask, logits, torch.tensor(-1e9, device=logits.device))
+            logits = torch.where(action_mask, logits, torch.tensor(-1e9, device=logits.device))
 
         dist = Categorical(logits=logits)
 
@@ -87,7 +94,9 @@ class ActorCritic(nn.Module):
 
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
-        value = self.critic(features).squeeze(-1)
+
+        critic_features = self.critic_trunk(obs)
+        value = self.critic(critic_features).squeeze(-1)
 
         return action, log_prob, entropy, value
 
@@ -148,7 +157,7 @@ class PPOSuperoptTrainer:
         rew_buf = torch.zeros((self.num_steps, self.num_envs), dtype=torch.float32, device=DEVICE)
         done_buf = torch.zeros((self.num_steps, self.num_envs), dtype=torch.float32, device=DEVICE)
         val_buf = torch.zeros((self.num_steps, self.num_envs), dtype=torch.float32, device=DEVICE)
-        mask_buf = torch.zeros((self.num_steps, self.num_envs, 10), dtype=torch.bool, device=DEVICE)
+        mask_buf = torch.zeros((self.num_steps, self.num_envs, 160), dtype=torch.bool, device=DEVICE)
 
         next_obs, info = self.envs.reset(seed=42)
         next_obs = torch.tensor(next_obs, dtype=torch.float32, device=DEVICE)
@@ -186,7 +195,10 @@ class PPOSuperoptTrainer:
                 next_done = torch.tensor(done_cpu, dtype=torch.float32, device=DEVICE)
 
                 rules_applied += sum(info_cpu.get("applied", [False]*self.num_envs))
-                ep_rewards.extend(reward_cpu[done_cpu].tolist())
+                # Track true episode returns: include zero-reward (failed) episodes
+                for env_idx in range(self.num_envs):
+                    if done_cpu[env_idx]:
+                        ep_rewards.append(float(reward_cpu[env_idx]))
 
             # 2. GAE-Lambda Advantage Computation
             with torch.no_grad():
@@ -211,7 +223,7 @@ class PPOSuperoptTrainer:
             b_advantages = advantages.reshape(-1)
             b_returns = returns.reshape(-1)
             b_values = val_buf.reshape(-1)
-            b_masks = mask_buf.reshape(-1, 10)
+            b_masks = mask_buf.reshape(-1, 160)
 
             # 3. PPO Optimization Epochs
             b_inds = np.arange(self.batch_size)
@@ -245,7 +257,13 @@ class PPOSuperoptTrainer:
                     pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                     # Value Loss
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    # Value loss with PPO clipping to prevent explosion
+                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                    v_clipped = b_values[mb_inds] + torch.clamp(
+                        newvalue - b_values[mb_inds], -self.clip_coef, self.clip_coef
+                    )
+                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
                     # Entropy Loss
                     entropy_loss = entropy.mean()

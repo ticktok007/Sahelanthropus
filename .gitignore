@@ -10,23 +10,36 @@ qemu-src.tar.xz
 *.core
 qemu_code.elf_*
 
-# === AnghaBench dataset ===
+# === AnghaBench & Compiler Datasets ===
 AnghaBench/
 anghabench_*.json
 anghabench_full_precomputed_baselines.json
+compiler-datasets/
+compiler_datasets_corpus.json
+dependency_heavy_corpus.json
+corpus_index.jsonl
+compiled_asm/
+Sahelanthropus/
 
 # === Corpus & precomputed data ===
 corpus.json
 anghabench_10k_corpus.json
 
-# === Training outputs / diagnostics ===
+# === Training outputs / diagnostics / checkpoints ===
+*.csv
+*.pt
+*.png
+wandb/
 learning_curve.csv
 learning_curve.json
-ppo_100k_learning_curve.csv
-ppo_100k_learning_curve.json
+ppo_100k_learning_curve*.csv
+ppo_100k_learning_curve*.json
 diagnostic_*.json
 diagnostics_*.json
 losses_*.json
+ppo_*charts*
+ppo_*losses*
+ppo_*diagnostics*
 measurements/
 reports/
 runs/

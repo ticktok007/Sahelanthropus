@@ -11,6 +11,7 @@ import math
 import os
 import re
 import warnings
+import collections
 from typing import Tuple, List, Dict, Optional, Any
 
 import numpy as np
@@ -20,6 +21,8 @@ from gymnasium.envs.registration import register
 from gymnasium.utils.env_checker import check_env
 from reward_env import RewardEnv, ToolchainError
 from peephole_rulebook import PeepholeRulebook, OPCODE_MAP, REG_MAP
+from equivalence_verifier import verify_equiv, verify_equiv_status
+from curriculum_scheduler import compute_curriculum_max_len
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +44,13 @@ def rule_matches(rule_idx: int, obs: np.ndarray) -> bool:
     return rulebook.rule_matches(rule_idx, obs)
 
 
+INT32_MIN = -(2**31)
+INT32_MAX = (2**31) - 1
+
+def _clamp_int32(val: int) -> int:
+    """Clamp a Python integer to int32 range to prevent numpy overflow."""
+    return max(INT32_MIN, min(INT32_MAX, val))
+
 def parse_assembly_instruction(line: str) -> List[int]:
     line = line.strip()
     if not line or line.startswith(".") or line.startswith("#") or line.endswith(":"):
@@ -58,30 +68,41 @@ def parse_assembly_instruction(line: str) -> List[int]:
     if op_str == "LI" and len(tokens) >= 3:
         rd = REG_MAP.get(tokens[1], 0)
         try:
-            imm = int(tokens[2], 0)
+            imm = _clamp_int32(int(tokens[2], 0))
         except ValueError:
             imm = 0
-    elif op_str in ("ADDI", "ANDI") and len(tokens) >= 4:
+    elif op_str in ("ADDI", "SLTI", "SLTIU", "XORI", "ORI", "ANDI", "SLLI", "SLLI_I", "SRLI", "SRAI", "JALR") and len(tokens) >= 3:
         rd = REG_MAP.get(tokens[1], 0)
-        rs1 = REG_MAP.get(tokens[2], 0)
-        try:
-            imm = int(tokens[3], 0)
-        except ValueError:
-            imm = 0
-    elif op_str in ("ADD", "SUB", "MUL", "DIV", "AND", "OR", "XOR") and len(tokens) >= 4:
+        if len(tokens) >= 4:
+            rs1 = REG_MAP.get(tokens[2], 0)
+            try:
+                imm = _clamp_int32(int(tokens[3], 0))
+            except ValueError:
+                imm = 0
+        else:
+            try:
+                imm = _clamp_int32(int(tokens[2], 0))
+            except ValueError:
+                imm = 0
+    elif op_str in ("ADD", "SUB", "SLL", "SLT", "SLTU", "SRL", "SRA", "MUL", "MULH", "MULHSU", "MULHU", "DIV", "DIVU", "REM", "REMU", "AND", "OR", "XOR") and len(tokens) >= 4:
         rd = REG_MAP.get(tokens[1], 0)
         rs1 = REG_MAP.get(tokens[2], 0)
         rs2 = REG_MAP.get(tokens[3], 0)
-    elif op_str in ("SLLI", "SRLI", "SRAI") and len(tokens) >= 4:
-        rd = REG_MAP.get(tokens[1], 0)
-        rs1 = REG_MAP.get(tokens[2], 0)
-        try:
-            imm = int(tokens[3], 0)
-        except ValueError:
-            imm = 0
-    elif op_str == "MV" and len(tokens) >= 3:
-        rd = REG_MAP.get(tokens[1], 0)
-        rs1 = REG_MAP.get(tokens[2], 0)
+    elif op_str in ("BEQ", "BNE", "BLT", "BGE", "BLTU", "BGEU") and len(tokens) >= 3:
+        rs1 = REG_MAP.get(tokens[1], 0)
+        rs2 = REG_MAP.get(tokens[2], 0)
+    elif op_str in ("JAL", "J") and len(tokens) >= 2:
+        if len(tokens) >= 3:
+            rd = REG_MAP.get(tokens[1], 0)
+            try:
+                imm = _clamp_int32(int(tokens[2], 0))
+            except ValueError:
+                imm = 0
+        else:
+            try:
+                imm = _clamp_int32(int(tokens[1], 0))
+            except ValueError:
+                imm = 0
 
     return [opcode_id, rs1, rs2, rd, imm]
 
@@ -153,19 +174,30 @@ class SuperoptEnv(gym.Env):
         corpus_path: str = "corpus.json",
         max_len: int = 16,
         num_rules: int = 10,
+        use_graph_obs: bool = True,
+        use_reward_shaping: bool = True,
+        gamma: float = 0.99,
         render_mode: Optional[str] = None
     ):
         super().__init__()
         self.corpus_path = corpus_path
         self.max_len = max_len
         self.num_rules = num_rules
+        self.use_graph_obs = use_graph_obs
+        self.use_reward_shaping = use_reward_shaping
+        self.gamma = gamma
         self.render_mode = render_mode
 
         # Connect Rulebook
         self.rulebook = PeepholeRulebook(num_rules=self.num_rules)
 
         self.corpus = self._load_corpus(corpus_path)
-        
+
+        # Verification Status Counters per Rule
+        self.rule_sat_counts: Dict[int, int] = collections.defaultdict(int)
+        self.rule_unsat_counts: Dict[int, int] = collections.defaultdict(int)
+        self.rule_timeout_counts: Dict[int, int] = collections.defaultdict(int)
+
         try:
             self.reward_env = RewardEnv(strict=False)
         except ToolchainError:
@@ -189,10 +221,49 @@ class SuperoptEnv(gym.Env):
         self.step_count = 0
         self.max_steps = 20
 
+    def update_curriculum(self, global_step: int) -> int:
+        """
+        Dynamically update max_len based on formula: min(8 + floor(17 * step / 500000), 25)
+        """
+        new_max_len = compute_curriculum_max_len(global_step)
+        if new_max_len != self.max_len:
+            self.max_len = new_max_len
+            self.observation_space = spaces.Box(
+                low=-2147483648,
+                high=2147483647,
+                shape=(self.max_len * 5,),
+                dtype=np.int32
+            )
+            self.action_space = spaces.Discrete(self.num_rules * self.max_len)
+        return self.max_len
+
     def _load_corpus(self, path: str) -> List[Dict[str, Any]]:
+        # Auto-fallback to full index corpus_index.jsonl if present and path is default/missing
+        if (path == "corpus.json" or not os.path.exists(path)) and os.path.exists("corpus_index.jsonl"):
+            path = "corpus_index.jsonl"
+
         if os.path.exists(path):
-            with open(path, "r") as f:
-                return json.load(f)
+            if path.endswith(".jsonl"):
+                # JSONL lazy-loading: store only lightweight index entries.
+                # Each line is a JSON object with 'asm_path' pointing to a
+                # .s file on disk; the assembly text is NOT loaded here.
+                corpus: List[Dict[str, Any]] = []
+                corpus_dir = os.path.dirname(os.path.abspath(path))
+                with open(path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        entry = json.loads(line)
+                        # Resolve relative asm_path against corpus directory
+                        if "asm_path" in entry and not os.path.isabs(entry["asm_path"]):
+                            entry["asm_path"] = os.path.join(corpus_dir, entry["asm_path"])
+                        corpus.append(entry)
+                return corpus
+            else:
+                # Standard JSON corpus (list of dicts with inline 'assembly')
+                with open(path, "r") as f:
+                    return json.load(f)
         return [
             {
                 "id": "func_default_mul",
@@ -201,21 +272,33 @@ class SuperoptEnv(gym.Env):
             }
         ]
 
-    def rule_matches(self, rule_idx: int, obs: Optional[np.ndarray] = None) -> bool:
-        if obs is None:
-            obs = self._get_obs()
-        return self.rulebook.rule_matches(rule_idx, obs)
+    def rule_matches(self, rule_idx: int, obs: Optional[Any] = None) -> bool:
+        obs_flat = self._get_obs_flat()
+        return self.rulebook.rule_matches(rule_idx, obs_flat)
 
-    def get_action_mask(self, obs: Optional[np.ndarray] = None) -> np.ndarray:
-        if obs is None:
-            obs = self._get_obs()
-        return self.rulebook.get_action_mask(obs)
+    def get_action_mask(self, obs: Optional[Any] = None) -> np.ndarray:
+        obs_flat = self._get_obs_flat()
+        return self.rulebook.get_action_mask(obs_flat)
 
-    def _get_obs(self) -> np.ndarray:
-        obs = np.zeros((self.max_len, 5), dtype=np.int32)
+    def _get_obs_flat(self) -> np.ndarray:
+        obs = np.zeros((self.max_len, 5), dtype=np.int64)
         for i, inst in enumerate(self.current_program[:self.max_len]):
-            obs[i] = np.array(inst, dtype=np.int32)
+            obs[i] = np.array(inst, dtype=np.int64)
+        obs = np.clip(obs, INT32_MIN, INT32_MAX).astype(np.int32)
         return obs.flatten()
+
+    def _get_obs(self) -> Any:
+        if self.use_graph_obs:
+            from asm_graph_builder import asm_to_graph
+            asm_text = program_to_assembly_text(self.current_program)
+            return asm_to_graph(asm_text, max_len=self.max_len)
+        return self._get_obs_flat()
+
+    def _count_instructions(self, meta: Dict[str, Any]) -> int:
+        if "assembly" in meta and meta["assembly"]:
+            lines = [l.strip() for l in meta["assembly"].splitlines() if l.strip() and not l.strip().startswith(".") and not l.strip().startswith("#") and not l.strip().endswith(":")]
+            return len(lines)
+        return meta.get("length", meta.get("baseline_cycles", 8))
 
     def reset(
         self,
@@ -226,15 +309,37 @@ class SuperoptEnv(gym.Env):
         super().reset(seed=seed)
         self.step_count = 0
 
-        idx = self.np_random.integers(0, len(self.corpus))
+        # Filter corpus: only sample functions with len(instrs) <= current max_len
+        valid_indices = [
+            i for i, meta in enumerate(self.corpus)
+            if self._count_instructions(meta) <= self.max_len
+        ]
+
+        if valid_indices:
+            idx = int(self.np_random.choice(valid_indices))
+        else:
+            idx = int(self.np_random.integers(0, len(self.corpus)))
+
         self.current_func_meta = self.corpus[idx]
 
-        asm_text = self.current_func_meta["assembly"]
+        # Lazy-load: read assembly from disk if asm_path is present,
+        # otherwise use inline 'assembly' text (backward compatible).
+        if "asm_path" in self.current_func_meta:
+            asm_file = self.current_func_meta["asm_path"]
+            with open(asm_file, "r") as f:
+                asm_text = f.read()
+        else:
+            asm_text = self.current_func_meta["assembly"]
         self.current_program = parse_assembly_program(asm_text, max_len=self.max_len)
 
         if self.reward_env:
             try:
-                self.baseline_cycles = float(self.reward_env.compile_and_run(asm_text))
+                baseline = float(self.reward_env.compile_and_run(asm_text))
+                # Guard: if compile_and_run returns penalty (negative), use corpus default
+                if baseline > 0:
+                    self.baseline_cycles = baseline
+                else:
+                    self.baseline_cycles = float(self.current_func_meta.get("baseline_cycles", 10.0))
             except Exception:
                 self.baseline_cycles = float(self.current_func_meta.get("baseline_cycles", 10.0))
         else:
@@ -251,6 +356,14 @@ class SuperoptEnv(gym.Env):
         }
         return obs, info
 
+    def _get_potential(self) -> float:
+        """
+        Potential function Phi(s) = -instruction_count(s).
+        Counts non-NOP instructions in self.current_program.
+        """
+        n_instrs = sum(1 for inst in self.current_program if inst[0] != OPCODE_MAP["NOP"])
+        return -float(n_instrs)
+
     def step(
         self,
         action: int
@@ -259,33 +372,66 @@ class SuperoptEnv(gym.Env):
         rule_id = action // self.max_len
         target_idx = action % self.max_len
 
+        # Potential at state s
+        phi_s = self._get_potential()
+
         reward = 0.0
         applied = False
 
         # Delegate rewrite execution to PeepholeRulebook
         if target_idx < len(self.current_program):
-            self.current_program, applied = self.rulebook.apply_rewrite(
+            orig_program = [list(inst) for inst in self.current_program]
+            candidate_program, applied = self.rulebook.apply_rewrite(
                 rule_id, self.current_program, target_idx
             )
+            if applied:
+                status = verify_equiv_status(orig_program, candidate_program, timeout=5.0)
+                if status == "UNSAT":
+                    self.current_program = candidate_program
+                    self.rule_unsat_counts[rule_id] += 1
+                elif status == "TIMEOUT":
+                    applied = False
+                    reward = -0.1  # Soft penalty for timeout: softer than incorrect (-1.0), harder than no-op (-0.01)
+                    self.rule_timeout_counts[rule_id] += 1
+                else:  # SAT or UNKNOWN
+                    applied = False
+                    reward = -1.0  # Hard penalty for incorrect / non-equivalent rewrite
+                    self.rule_sat_counts[rule_id] += 1
 
         if applied:
             new_asm_str = program_to_assembly_text(self.current_program)
             if self.reward_env:
                 try:
                     new_cycles = float(self.reward_env.compile_and_run(new_asm_str))
-                    cycle_ratio = (self.baseline_cycles - new_cycles) / max(1.0, self.baseline_cycles)
-                    reward = float(cycle_ratio - 0.01)
-                    self.current_cycles = new_cycles
+                    # Guard: if compile_and_run returns penalty (negative), use est_savings
+                    if new_cycles < 0:
+                        rule_info = self.rulebook.get_rule_info(rule_id)
+                        reward = float((rule_info.get("est_savings", 1.0) / max(1.0, self.baseline_cycles)) - 0.01)
+                    else:
+                        cycle_ratio = (self.baseline_cycles - new_cycles) / max(1.0, self.baseline_cycles)
+                        reward = float(cycle_ratio - 0.01)
+                        self.current_cycles = new_cycles
                 except Exception:
                     rule_info = self.rulebook.get_rule_info(rule_id)
                     reward = float((rule_info.get("est_savings", 1.0) / max(1.0, self.baseline_cycles)) - 0.01)
             else:
                 rule_info = self.rulebook.get_rule_info(rule_id)
                 reward = float((rule_info.get("est_savings", 1.0) / max(1.0, self.baseline_cycles)) - 0.01)
-        else:
-            reward = 0.0
 
-        terminated = applied or (self.step_count >= self.max_steps)
+        # Potential-based reward shaping: r_shaped = r + gamma * Phi(s') - Phi(s)
+        phi_s_prime = self._get_potential()
+        if self.use_reward_shaping:
+            shaping_signal = (self.gamma * phi_s_prime) - phi_s
+            reward = float(reward + shaping_signal)
+
+        # Episode termination tuning: success terminal if total_speedup > 15% (bonus +1.0)
+        total_speedup = (self.baseline_cycles - self.current_cycles) / max(1.0, self.baseline_cycles)
+        is_success = (total_speedup > 0.15)
+
+        if is_success:
+            reward = float(reward + 1.0)  # Bonus +1.0 for achieving >15% speedup
+
+        terminated = is_success or applied or (self.step_count >= self.max_steps)
         truncated = False
         obs = self._get_obs()
         
@@ -295,6 +441,8 @@ class SuperoptEnv(gym.Env):
             "target_idx": target_idx,
             "current_cycles": self.current_cycles,
             "baseline_cycles": self.baseline_cycles,
+            "total_speedup": total_speedup,
+            "success": is_success,
             "action_mask": self.get_action_mask(obs)
         }
 

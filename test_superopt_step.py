@@ -18,7 +18,7 @@ class TestSuperoptStep(unittest.TestCase):
         obs, info = self.env.reset(seed=42)
         self.assertIn("action_mask", info)
         self.assertIsInstance(info["action_mask"], np.ndarray)
-        self.assertEqual(info["action_mask"].shape, (5,))
+        self.assertEqual(info["action_mask"].shape, (80,))  # num_rules(5) * max_len(16)
 
     def test_step_valid_rewrite_rule0(self):
         """Tests applying Rule 0 (mul -> slli) and verifying info['action_mask']."""
@@ -34,7 +34,7 @@ class TestSuperoptStep(unittest.TestCase):
 
         # Check action mask before step
         action_mask_before = self.env.get_action_mask()
-        self.assertTrue(action_mask_before[0], "Rule 0 should be True in action_mask before step!")
+        self.assertTrue(action_mask_before[2], "Rule 0 at slot 2 should be True in per-slot action_mask!")
 
         # Action: Rule 0 on target_idx 2 -> action = 0 * 16 + 2 = 2
         action = 2
@@ -45,7 +45,7 @@ class TestSuperoptStep(unittest.TestCase):
         
         self.assertTrue(step_info['applied'])
         self.assertIn("action_mask", step_info)
-        self.assertEqual(step_info["action_mask"].shape, (5,))
+        self.assertEqual(step_info["action_mask"].shape, (80,))  # num_rules(5) * max_len(16)
 
     def test_step_unmatched_pattern(self):
         """Tests applying an unmatched action pattern returns reward = 0.0."""

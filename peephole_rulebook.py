@@ -23,7 +23,13 @@ import numpy as np
 OPCODE_MAP = {
     "NOP": 0, "LI": 1, "ADD": 2, "ADDI": 3, "SUB": 4, "MUL": 5, "DIV": 6,
     "SLLI": 7, "SRLI": 8, "SRAI": 9, "AND": 10, "OR": 11, "XOR": 12,
-    "MV": 13, "LD": 14, "SD": 15, "ANDI": 16, "ECALL": 17, "OTHER": 18
+    "MV": 13, "LD": 14, "SD": 15, "ANDI": 16, "ECALL": 17,
+    "SLTI": 18, "SLTIU": 19, "XORI": 20, "ORI": 21, "SLLI_I": 22,
+    "BEQ": 23, "BNE": 24, "BLT": 25, "BGE": 26, "BLTU": 27, "BGEU": 28,
+    "JAL": 29, "JALR": 30, "J": 31,
+    "MULH": 33, "MULHSU": 34, "MULHU": 35, "DIVU": 36, "REM": 37, "REMU": 38,
+    "SLL": 40, "SLT": 41, "SLTU": 42, "SRL": 43, "SRA": 44,
+    "OTHER": 45
 }
 
 REG_MAP = {
@@ -37,7 +43,7 @@ REG_MAP = {
 
 RULE_METADATA = [
     {"id": 0, "name": "mul_power2_to_slli", "desc": "mul x, 2^k -> slli x, k", "est_savings": 3.0},
-    {"id": 1, "name": "sdiv_power2_to_srai", "desc": "sdiv x, 2^k -> srai x, k", "est_savings": 20.0},
+    {"id": 1, "name": "udiv_power2_to_srli", "desc": "udiv x, 2^k -> srli x, k", "est_savings": 20.0},
     {"id": 2, "name": "add_zero_to_nop", "desc": "add x, 0 -> x", "est_savings": 1.0},
     {"id": 3, "name": "mul_zero_to_li_0", "desc": "mul x, 0 -> 0", "est_savings": 2.0},
     {"id": 4, "name": "xor_self_to_li_0", "desc": "xor x, x -> 0", "est_savings": 1.0},
@@ -81,15 +87,15 @@ class PeepholeRulebook:
                 if imm_val > 0 and (imm_val & (imm_val - 1)) == 0:
                     return True
 
-        # Rule 1: sdiv x, 2^k -> srai x, k
-        elif rule_id == 1 and opcode == OPCODE_MAP["DIV"] and target_idx > 0:
+        # Rule 1: divu x, 2^k -> srli x, k (Unsigned division by power of 2)
+        elif rule_id == 1 and opcode == OPCODE_MAP.get("DIVU", OPCODE_MAP["DIV"]) and target_idx > 0:
             prev_inst = program[target_idx - 1]
             if prev_inst[0] == OPCODE_MAP["LI"] and prev_inst[3] == rs2:
                 imm_val = prev_inst[4]
                 if imm_val > 0 and (imm_val & (imm_val - 1)) == 0:
                     return True
 
-        # Rule 2: add x, 0 -> x
+        # Rule 2: addi rd, rs1, 0 -> mv rd, rs1 (or NOP if rd == rs1)
         elif rule_id == 2 and opcode == OPCODE_MAP["ADDI"] and imm == 0:
             return True
 
@@ -168,16 +174,19 @@ class PeepholeRulebook:
             k = int(math.log2(imm_val))
             new_program[target_idx] = [OPCODE_MAP["SLLI"], rs1, 0, rd, k]
 
-        # Rule 1: sdiv x, 2^k -> srai x, k
+        # Rule 1: divu x, 2^k -> srli x, k
         elif rule_id == 1:
             prev_inst = new_program[target_idx - 1]
             imm_val = prev_inst[4]
             k = int(math.log2(imm_val))
-            new_program[target_idx] = [OPCODE_MAP["SRAI"], rs1, 0, rd, k]
+            new_program[target_idx] = [OPCODE_MAP["SRLI"], rs1, 0, rd, k]
 
-        # Rule 2: add x, 0 -> x (NOP)
+        # Rule 2: addi rd, rs1, 0 -> mv rd, rs1 (or NOP if rd == rs1)
         elif rule_id == 2:
-            new_program[target_idx] = [OPCODE_MAP["NOP"], 0, 0, 0, 0]
+            if rd == rs1:
+                new_program[target_idx] = [OPCODE_MAP["NOP"], 0, 0, 0, 0]
+            else:
+                new_program[target_idx] = [OPCODE_MAP["MV"], rs1, 0, rd, 0]
 
         # Rule 3: mul x, 0 -> 0
         elif rule_id == 3:
@@ -209,7 +218,6 @@ class PeepholeRulebook:
         elif rule_id == 8:
             prev_inst = new_program[target_idx - 1]
             x_reg = prev_inst[1]
-            new_program[target_idx - 1] = [OPCODE_MAP["NOP"], 0, 0, 0, 0]
             if rd == x_reg:
                 new_program[target_idx] = [OPCODE_MAP["NOP"], 0, 0, 0, 0]
             else:
@@ -220,14 +228,27 @@ class PeepholeRulebook:
             prev_inst = new_program[target_idx - 1]
             x_reg = prev_inst[1]
             k1 = prev_inst[4]
-            mask = ((1 << (32 - k1)) - 1)
-            new_program[target_idx - 1] = [OPCODE_MAP["NOP"], 0, 0, 0, 0]
+            k1_clamped = max(0, min(k1, 31))
+            mask = ((1 << (32 - k1_clamped)) - 1)
             new_program[target_idx] = [OPCODE_MAP["ANDI"], x_reg, 0, rd, mask]
 
         return new_program, True
 
-    def get_action_mask(self, obs: np.ndarray) -> np.ndarray:
+    def get_action_mask(self, obs: np.ndarray, max_len: int = 16) -> np.ndarray:
         """
-        Computes boolean action mask vector of shape (num_rules,) = (10,).
+        Computes per-slot boolean action mask of shape (num_rules * max_len,) = (160,).
+        Entry [rule_id * max_len + slot] is True iff rule_id matches at slot.
         """
-        return np.array([self.rule_matches(i, obs) for i in range(self.num_rules)], dtype=bool)
+        if obs.ndim == 1:
+            max_len = len(obs) // 5
+            prog = obs.reshape((max_len, 5)).tolist()
+        else:
+            prog = obs.tolist()
+            max_len = len(prog)
+
+        mask = np.zeros(self.num_rules * max_len, dtype=bool)
+        for r in range(self.num_rules):
+            for slot in range(max_len):
+                if self.matches_at(r, prog, slot):
+                    mask[r * max_len + slot] = True
+        return mask

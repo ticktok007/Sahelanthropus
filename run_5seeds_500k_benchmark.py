@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""
+run_5seeds_500k_benchmark.py — 500K Step Multi-Seed PPO Experiment (Seeds 0-4).
+Measures:
+    1. Mean episode reward across 5 independent seeds
+    2. 95% Confidence Interval (CI) = 1.96 * (std / sqrt(5))
+    3. Plots mean ± 95% CI band across 500,000 steps.
+"""
+
+import math
+import os
+import time
+import csv
+import argparse
+from typing import List, Tuple, Dict, Any
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import gymnasium as gym
+import matplotlib.pyplot as plt
+
+from superopt_env import SuperoptEnv
+from ppo_gnn_actor_critic import GNNActorCritic
+from graph_ppo_rollout_buffer import GraphRolloutBuffer
+from run_verified_gnn_ppo import GraphVectorEnv
+from curriculum_scheduler import compute_curriculum_max_len
+from utils_seed import set_seed
+from torch_geometric.data import Batch
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+plt.style.use("seaborn-v0_8-darkgrid" if "seaborn-v0_8-darkgrid" in plt.style.available else "default")
+
+
+def make_env_for_seed(env_id: str, seed: int, idx: int) -> gym.Env:
+    env = gym.make(env_id)
+    env.unwrapped.use_graph_obs = True
+    env.unwrapped.use_reward_shaping = True
+    env.action_space.seed(seed + idx)
+    return env
+
+
+def train_single_seed_500k(
+    seed: int,
+    total_steps: int = 500000,
+    num_steps: int = 256,
+    lr: float = 3e-4,
+    clip_coef: float = 0.1,
+    csv_out: str = "5seed_curve_seed0.csv"
+) -> Tuple[List[int], List[float], List[int]]:
+    print("\n" + "=" * 75)
+    print(f" LAUNCHING 500K EXPERIMENT: SEED {seed}")
+    print("=" * 75)
+
+    set_seed(seed)
+
+    num_envs = 4
+    batch_size = num_envs * num_steps
+    num_updates = math.ceil(total_steps / batch_size)
+
+    initial_max_len = compute_curriculum_max_len(0)
+
+    envs = GraphVectorEnv([
+        lambda idx=i: make_env_for_seed("SuperoptEnv-v0", seed=seed, idx=idx)
+        for i in range(num_envs)
+    ])
+
+    for sub_env in envs.envs:
+        sub_env.unwrapped.max_len = initial_max_len
+
+    agent = GNNActorCritic(
+        inst_in_dim=177, reg_in_dim=1, hidden_dim=128, embed_dim=256,
+        num_rules=10, max_len=25, num_heads=8, num_layers=3
+    ).to(DEVICE)
+
+    if os.path.exists("pretrained_gat_encoder.pt"):
+        state_dict = torch.load("pretrained_gat_encoder.pt", weights_only=True)
+        agent.encoder.load_state_dict(state_dict)
+
+    optimizer = optim.Adam(agent.parameters(), lr=lr, eps=1e-5)
+    rollout_buffer = GraphRolloutBuffer(num_steps=num_steps, num_envs=num_envs)
+
+    csv_file = open(csv_out, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["update", "global_step", "max_len", "episode_reward_mean", "explained_variance", "rules_applied"])
+
+    global_step = 0
+    next_obs_list, infos = envs.reset(seed=seed)
+    next_done = torch.zeros(num_envs, dtype=torch.float32, device=DEVICE)
+    next_mask = torch.tensor(infos["action_mask"], dtype=torch.bool, device=DEVICE)
+
+    ep_returns = [0.0] * num_envs
+    completed_returns = []
+    total_rules = 0
+
+    recorded_steps = []
+    recorded_rewards = []
+    recorded_rules = []
+
+    for update in range(1, num_updates + 1):
+        frac = 1.0 - (update - 1.0) / num_updates
+        optimizer.param_groups[0]["lr"] = frac * lr
+
+        # Update curriculum max_len
+        curr_max_len = compute_curriculum_max_len(global_step)
+        for sub_env in envs.envs:
+            sub_env.unwrapped.update_curriculum(global_step)
+
+        for step in range(num_steps):
+            global_step += num_envs
+
+            step_batch = Batch.from_data_list(next_obs_list)
+            x_dict = {k: v.to(DEVICE) for k, v in step_batch.x_dict.items()}
+            edge_dict = {k: v.to(DEVICE) for k, v in step_batch.edge_index_dict.items()}
+            batch_dict = {'inst': step_batch['inst'].batch.to(DEVICE), 'reg': step_batch['reg'].batch.to(DEVICE)}
+
+            with torch.no_grad():
+                act, logp, _, val = agent.get_action_and_value(x_dict, edge_dict, action_mask=next_mask, batch_dict=batch_dict)
+
+            rollout_buffer.insert(step, next_obs_list, act, logp, torch.zeros(num_envs), next_done, val, next_mask)
+
+            next_obs_list, reward, terms, truncs, step_info = envs.step(act.cpu().numpy())
+            dones = np.logical_or(terms, truncs)
+            next_done = torch.tensor(dones, dtype=torch.float32, device=DEVICE)
+            rollout_buffer.rewards[step] = torch.tensor(reward, dtype=torch.float32)
+            next_mask = torch.tensor(step_info["action_mask"], dtype=torch.bool, device=DEVICE)
+
+            for e in range(num_envs):
+                ep_returns[e] += reward[e]
+                if step_info.get("applied", [False]*num_envs)[e]:
+                    total_rules += 1
+                if dones[e]:
+                    completed_returns.append(ep_returns[e])
+                    ep_returns[e] = 0.0
+
+        # GAE Optimization
+        with torch.no_grad():
+            next_batch = Batch.from_data_list(next_obs_list)
+            x_next = {k: v.to(DEVICE) for k, v in next_batch.x_dict.items()}
+            edge_next = {k: v.to(DEVICE) for k, v in next_batch.edge_index_dict.items()}
+            b_next = {'inst': next_batch['inst'].batch.to(DEVICE), 'reg': next_batch['reg'].batch.to(DEVICE)}
+            next_val = agent.get_value(x_next, edge_next, batch_dict=b_next).cpu()
+
+            advantages = torch.zeros_like(rollout_buffer.rewards)
+            lastgaelam = 0
+            for t in reversed(range(num_steps)):
+                if t == num_steps - 1:
+                    nextnonterminal = 1.0 - next_done.cpu()
+                    nextvalues = next_val
+                else:
+                    nextnonterminal = 1.0 - rollout_buffer.dones[t + 1]
+                    nextvalues = rollout_buffer.values[t + 1]
+                delta = rollout_buffer.rewards[t] + 0.99 * nextvalues * nextnonterminal - rollout_buffer.values[t]
+                advantages[t] = lastgaelam = delta + 0.99 * 0.95 * nextnonterminal * lastgaelam
+            returns = advantages + rollout_buffer.values
+
+        adv_norm = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        loader = rollout_buffer.get_dataloader(adv_norm, returns, minibatch_size=256)
+
+        for epoch in range(4):
+            for mb in loader:
+                mb_x = {k: v.to(DEVICE) for k, v in mb.x_dict.items()}
+                mb_edge = {k: v.to(DEVICE) for k, v in mb.edge_index_dict.items()}
+                mb_b = {'inst': mb['inst'].batch.to(DEVICE), 'reg': mb['reg'].batch.to(DEVICE)}
+                mb_act = mb.action.to(DEVICE)
+                mb_logp = mb.logprob.to(DEVICE)
+                mb_adv = mb.advantage.to(DEVICE)
+                mb_ret = mb.return_val.to(DEVICE)
+                mb_val = mb.value.to(DEVICE)
+                mb_mask = mb.action_mask.to(DEVICE)
+
+                _, newlogp, entropy, newval = agent.get_action_and_value(mb_x, mb_edge, action=mb_act, action_mask=mb_mask, batch_dict=mb_b)
+                logratio = newlogp - mb_logp
+                ratio = logratio.exp()
+
+                pg_loss1 = -mb_adv * ratio
+                pg_loss2 = -mb_adv * torch.clamp(ratio, 0.9, 1.1)
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                v_loss = 0.5 * ((newval - mb_ret) ** 2).mean()
+
+                loss = pg_loss - 0.01 * entropy.mean() + 0.5 * v_loss
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
+                optimizer.step()
+
+        mean_rew = np.mean(completed_returns[-50:]) if completed_returns else 0.0
+        y_true = returns.numpy().flatten()
+        y_pred = rollout_buffer.values.numpy().flatten()
+        var_y = np.var(y_true)
+        expl_var = 1.0 - (np.var(y_true - y_pred) / (var_y + 1e-8)) if var_y > 1e-8 else 0.0
+
+        recorded_steps.append(global_step)
+        recorded_rewards.append(mean_rew)
+        recorded_rules.append(total_rules)
+
+        csv_writer.writerow([update, global_step, curr_max_len, mean_rew, expl_var, total_rules])
+        csv_file.flush()
+
+        if update % 25 == 0 or update == num_updates:
+            print(f" [Seed {seed}] Update {update:>4d}/{num_updates} | Steps: {global_step:>7,d} | max_len: {curr_max_len:>2d} | Mean Ep Rew: {mean_rew:+.4f} | Rules: {total_rules:>3d}")
+
+    csv_file.close()
+    envs.close()
+    return recorded_steps, recorded_rewards, recorded_rules
+
+
+def compute_statistics_and_plot(seeds_data: Dict[int, Tuple[List[int], List[float], List[int]]]):
+    print("\n" + "=" * 75)
+    print(" CALCULATING 95% CONFIDENCE INTERVAL STATISTICS & PLOTTING")
+    print("=" * 75)
+
+    # Standardize step grid across seeds
+    steps = seeds_data[0][0]
+    n_seeds = len(seeds_data)
+    n_points = len(steps)
+
+    reward_matrix = np.zeros((n_seeds, n_points))
+    for s_idx, s in enumerate(seeds_data.keys()):
+        reward_matrix[s_idx] = seeds_data[s][1]
+
+    mean_rewards = np.mean(reward_matrix, axis=0)
+    std_rewards = np.std(reward_matrix, axis=0, ddof=1)
+    
+    # 95% Confidence Interval: 1.96 * (std / sqrt(N))
+    stderr = std_rewards / math.sqrt(n_seeds)
+    ci95 = 1.96 * stderr
+
+    # Save aggregated statistics CSV
+    with open("5seed_500k_aggregated.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["global_step", "mean_reward", "std_reward", "ci95_lower", "ci95_upper"])
+        for i in range(n_points):
+            writer.writerow([
+                steps[i],
+                mean_rewards[i],
+                std_rewards[i],
+                mean_rewards[i] - ci95[i],
+                mean_rewards[i] + ci95[i]
+            ])
+
+    print(" [+] Saved 5seed_500k_aggregated.csv!")
+
+    # Plotting Mean ± 95% CI
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
+
+    # Individual seed trajectories (faint)
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    for s_idx, s in enumerate(seeds_data.keys()):
+        ax.plot(steps, reward_matrix[s_idx], label=f"Seed {s}", color=colors[s_idx], alpha=0.3, linewidth=1.0)
+
+    # Mean trajectory (bold)
+    ax.plot(steps, mean_rewards, label="5-Seed Mean PPO Reward", color="#1f77b4", linewidth=2.5)
+
+    # 95% CI Shaded Band
+    ax.fill_between(
+        steps,
+        mean_rewards - ci95,
+        mean_rewards + ci95,
+        color="#1f77b4",
+        alpha=0.25,
+        label="95% Confidence Interval (±1.96 SE)"
+    )
+
+    ax.set_title("500K PPO Benchmark: Episode Reward (5 Independent Seeds)", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Environment Steps", fontsize=11)
+    ax.set_ylabel("Episode Reward Mean", fontsize=11)
+    ax.legend(loc="upper left", frameon=True)
+    ax.grid(True, linestyle="--", alpha=0.6)
+
+    plt.tight_layout()
+    out_png = "ppo_500k_5seeds_mean_ci95.png"
+    plt.savefig(out_png, dpi=300)
+    print(f" [+] Saved publication-quality plot to {out_png}!")
+    print("=" * 75)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--steps", type=int, default=500000)
+    args = parser.parse_args()
+
+    seeds = [0, 1, 2, 3, 4]
+    seeds_data: Dict[int, Tuple[List[int], List[float], List[int]]] = {}
+
+    for s in seeds:
+        csv_out = f"5seed_curve_seed{s}.csv"
+        steps, rewards, rules = train_single_seed_500k(seed=s, total_steps=args.steps, csv_out=csv_out)
+        seeds_data[s] = (steps, rewards, rules)
+
+    compute_statistics_and_plot(seeds_data)
+
+
+if __name__ == "__main__":
+    main()
