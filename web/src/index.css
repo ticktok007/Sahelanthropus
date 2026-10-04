@@ -1,0 +1,202 @@
+@import "tailwindcss";
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SAHELANTHROPUS — Design System & Global Styles
+   RISC-V Neural Superoptimizer & Formal Verification Platform
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+
+/* ── CSS Custom Properties ────────────────────────────────────────────── */
+:root {
+  /* Backgrounds */
+  --bg-root: #070B12;
+  --bg-secondary: #0D131D;
+  --bg-panel: #111A26;
+  --bg-elevated: #172231;
+  --bg-hover: #1C2A3A;
+  --bg-active: #223344;
+  --bg-terminal: #0A0E14;
+
+  /* Borders */
+  --border-default: #263445;
+  --border-subtle: #1A2535;
+  --border-focus: #00D9FF;
+
+  /* Text */
+  --text-primary: #E6EDF3;
+  --text-secondary: #8B9AAF;
+  --text-tertiary: #5A6B7F;
+  --text-disabled: #3A4A5A;
+
+  /* Semantic Colors */
+  --cyan: #00D9FF;
+  --cyan-dim: #00D9FF33;
+  --cyan-glow: 0 0 12px #00D9FF44;
+  --blue: #4D8DFF;
+  --blue-dim: #4D8DFF33;
+  --purple: #9B7CFF;
+  --purple-dim: #9B7CFF33;
+  --green: #36D399;
+  --green-dim: #36D39933;
+  --amber: #FFB84D;
+  --amber-dim: #FFB84D33;
+  --red: #FF5C6C;
+  --red-dim: #FF5C6C33;
+
+  /* Typography */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+
+  /* Spacing */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+  --sp-16: 64px;
+
+  /* Radius */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
+  --shadow-md: 0 2px 8px rgba(0,0,0,0.4);
+  --shadow-lg: 0 4px 16px rgba(0,0,0,0.5);
+  --shadow-glow-cyan: 0 0 20px rgba(0,217,255,0.15);
+
+  /* Transitions */
+  --transition-fast: 150ms ease;
+  --transition-normal: 250ms ease;
+  --transition-slow: 400ms ease;
+
+  /* Layout */
+  --sidebar-width: 240px;
+  --topbar-height: 52px;
+  --console-height: 200px;
+}
+
+/* ── Reset / Normalize ────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg-root);
+  color: var(--text-primary);
+  line-height: 1.5;
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
+}
+
+#root {
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
+a { color: var(--cyan); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+button {
+  font-family: var(--font-sans);
+  cursor: pointer;
+  border: none;
+  outline: none;
+}
+
+input, textarea, select {
+  font-family: var(--font-mono);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: var(--sp-2) var(--sp-3);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+input:focus, textarea:focus, select:focus {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 2px var(--cyan-dim);
+}
+
+/* ── Scrollbar ────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--bg-secondary); }
+::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #3A4A5A; }
+::-webkit-scrollbar-corner { background: var(--bg-secondary); }
+
+/* ── Focus Visible ────────────────────────────────────────────────────── */
+:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+/* ── Keyframes ────────────────────────────────────────────────────────── */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideInUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideInLeft {
+  from { opacity: 0; transform: translateX(-12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200px 0; }
+  100% { background-position: 200px 0; }
+}
+
+@keyframes stagePulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--cyan-dim); }
+  50% { box-shadow: 0 0 0 4px var(--cyan-dim); }
+}
+
+@keyframes countUp {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes flowDash {
+  to { stroke-dashoffset: -20; }
+}
+
+@keyframes glowPulse {
+  0%, 100% { filter: drop-shadow(0 0 4px var(--cyan)); }
+  50% { filter: drop-shadow(0 0 12px var(--cyan)); }
+}
+
+/* ── Selection ────────────────────────────────────────────────────────── */
+::selection {
+  background: var(--cyan-dim);
+  color: var(--text-primary);
+}
