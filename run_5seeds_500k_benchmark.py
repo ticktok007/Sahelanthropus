@@ -33,6 +33,19 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 plt.style.use("seaborn-v0_8-darkgrid" if "seaborn-v0_8-darkgrid" in plt.style.available else "default")
 
 
+def format_time(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    elif m > 0:
+        return f"{m}m {s:02d}s"
+    else:
+        return f"{s}s"
+
+
 def make_env_for_seed(env_id: str, seed: int, idx: int) -> gym.Env:
     env = gym.make(env_id)
     env.unwrapped.use_graph_obs = True
@@ -47,7 +60,9 @@ def train_single_seed_500k(
     num_steps: int = 256,
     lr: float = 3e-4,
     clip_coef: float = 0.1,
-    csv_out: str = "5seed_curve_seed0.csv"
+    csv_out: str = "5seed_curve_seed0.csv",
+    seed_idx: int = 0,
+    total_seeds: int = 5
 ) -> Tuple[List[int], List[float], List[int]]:
     print("\n" + "=" * 75)
     print(f" LAUNCHING 500K EXPERIMENT: SEED {seed}")
@@ -59,7 +74,45 @@ def train_single_seed_500k(
     batch_size = num_envs * num_steps
     num_updates = math.ceil(total_steps / batch_size)
 
-    initial_max_len = compute_curriculum_max_len(0)
+    ckpt_file = f"seed_{seed}_ckpt.pt"
+    start_update = 1
+    global_step = 0
+    total_rules = 0
+    completed_returns = []
+    recorded_steps = []
+    recorded_rewards = []
+    recorded_rules = []
+
+    if os.path.exists(csv_out):
+        try:
+            steps_in, rews_in, rules_in = [], [], []
+            with open(csv_out, "r") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                for row in reader:
+                    if len(row) >= 6:
+                        steps_in.append(int(row[1]))
+                        rews_in.append(float(row[3]))
+                        rules_in.append(int(row[5]))
+            if len(steps_in) >= num_updates:
+                print(f" [Seed {seed}] Found complete CSV {csv_out} ({len(steps_in)} updates). Skipping training.")
+                return steps_in[:num_updates], rews_in[:num_updates], rules_in[:num_updates]
+            elif os.path.exists(ckpt_file):
+                ckpt = torch.load(ckpt_file, map_location=DEVICE, weights_only=False)
+                if ckpt.get("update", 0) > 0:
+                    start_update = ckpt["update"] + 1
+                    global_step = ckpt["global_step"]
+                    total_rules = ckpt["total_rules"]
+                    completed_returns = ckpt["completed_returns"]
+                    recorded_steps = steps_in[:ckpt["update"]]
+                    recorded_rewards = rews_in[:ckpt["update"]]
+                    recorded_rules = rules_in[:ckpt["update"]]
+                    print(f" [Seed {seed}] Resuming from update {start_update}/{num_updates} (global_step: {global_step:,})")
+        except Exception as e:
+            print(f" [Seed {seed}] Could not parse existing CSV/checkpoint: {e}. Starting fresh.")
+            start_update = 1
+
+    initial_max_len = compute_curriculum_max_len(global_step)
 
     envs = GraphVectorEnv([
         lambda idx=i: make_env_for_seed("SuperoptEnv-v0", seed=seed, idx=idx)
@@ -81,25 +134,26 @@ def train_single_seed_500k(
     optimizer = optim.Adam(agent.parameters(), lr=lr, eps=1e-5)
     rollout_buffer = GraphRolloutBuffer(num_steps=num_steps, num_envs=num_envs)
 
-    csv_file = open(csv_out, "w", newline="")
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(["update", "global_step", "max_len", "episode_reward_mean", "explained_variance", "rules_applied"])
+    if start_update > 1 and os.path.exists(ckpt_file):
+        ckpt = torch.load(ckpt_file, map_location=DEVICE, weights_only=False)
+        agent.load_state_dict(ckpt["agent"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        csv_file = open(csv_out, "a", newline="")
+        csv_writer = csv.writer(csv_file)
+    else:
+        csv_file = open(csv_out, "w", newline="")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(["update", "global_step", "max_len", "episode_reward_mean", "explained_variance", "rules_applied"])
 
-    global_step = 0
     next_obs_list, infos = envs.reset(seed=seed)
     next_done = torch.zeros(num_envs, dtype=torch.float32, device=DEVICE)
     next_mask = torch.tensor(infos["action_mask"], dtype=torch.bool, device=DEVICE)
 
     ep_returns = [0.0] * num_envs
-    completed_returns = []
-    total_rules = 0
+    start_time = time.time()
 
-    recorded_steps = []
-    recorded_rewards = []
-    recorded_rules = []
-
-    for update in range(1, num_updates + 1):
-        frac = 1.0 - (update - 1.0) / num_updates
+    for update in range(start_update, num_updates + 1):
+        frac = max(0.1, 1.0 - (update - 1.0) / num_updates)
         optimizer.param_groups[0]["lr"] = frac * lr
 
         # Update curriculum max_len
@@ -175,9 +229,13 @@ def train_single_seed_500k(
                 ratio = logratio.exp()
 
                 pg_loss1 = -mb_adv * ratio
-                pg_loss2 = -mb_adv * torch.clamp(ratio, 0.9, 1.1)
+                pg_loss2 = -mb_adv * torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-                v_loss = 0.5 * ((newval - mb_ret) ** 2).mean()
+
+                v_loss_unclipped = (newval - mb_ret) ** 2
+                v_clipped = mb_val + torch.clamp(newval - mb_val, -clip_coef, clip_coef)
+                v_loss_clipped = (v_clipped - mb_ret) ** 2
+                v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
                 loss = pg_loss - 0.01 * entropy.mean() + 0.5 * v_loss
                 optimizer.zero_grad()
@@ -198,8 +256,27 @@ def train_single_seed_500k(
         csv_writer.writerow([update, global_step, curr_max_len, mean_rew, expl_var, total_rules])
         csv_file.flush()
 
-        if update % 25 == 0 or update == num_updates:
-            print(f" [Seed {seed}] Update {update:>4d}/{num_updates} | Steps: {global_step:>7,d} | max_len: {curr_max_len:>2d} | Mean Ep Rew: {mean_rew:+.4f} | Rules: {total_rules:>3d}")
+        if update % 10 == 0 or update == num_updates:
+            elapsed = time.time() - start_time
+            updates_done = update - start_update + 1
+            sec_per_update = elapsed / max(1, updates_done)
+
+            rem_updates_seed = num_updates - update
+            eta_seed = rem_updates_seed * sec_per_update
+
+            rem_seeds = total_seeds - seed_idx - 1
+            rem_updates_total = (rem_seeds * num_updates) + rem_updates_seed
+            eta_total = rem_updates_total * sec_per_update
+
+            print(f" [Seed {seed} ({seed_idx+1}/{total_seeds})] Update {update:>4d}/{num_updates} | Steps: {global_step:>7,d} | max_len: {curr_max_len:>2d} | Mean Ep Rew: {mean_rew:+.4f} | Rules: {total_rules:>3d} | ETA Seed: {format_time(eta_seed)} | ETA Total: {format_time(eta_total)}")
+            torch.save({
+                "update": update,
+                "global_step": global_step,
+                "total_rules": total_rules,
+                "completed_returns": completed_returns[-50:],
+                "agent": agent.state_dict(),
+                "optimizer": optimizer.state_dict(),
+            }, ckpt_file)
 
     csv_file.close()
     envs.close()
@@ -221,8 +298,19 @@ def compute_statistics_and_plot(seeds_data: Dict[int, Tuple[List[int], List[floa
         reward_matrix[s_idx] = seeds_data[s][1]
 
     mean_rewards = np.mean(reward_matrix, axis=0)
-    std_rewards = np.std(reward_matrix, axis=0, ddof=1)
+    std_rewards = np.std(reward_matrix, axis=0, ddof=1) if n_seeds > 1 else np.zeros_like(mean_rewards)
     
+    # Relative Standard Deviation: std / |mean|
+    rel_std = std_rewards / (np.abs(mean_rewards) + 1e-8)
+    avg_rel_std = np.mean(rel_std) * 100.0
+    max_rel_std = np.max(rel_std) * 100.0
+
+    print(f" [+] Stability Diagnostic: Avg (Std / Mean) = {avg_rel_std:.2f}%, Max = {max_rel_std:.2f}%")
+    if avg_rel_std > 30.0:
+        print(f" [!] WARNING: Training instability detected! Avg (Std / Mean) is {avg_rel_std:.2f}% (Threshold: 30.0%).")
+    else:
+        print(f" [+] STABILITY VERIFIED: Avg (Std / Mean) {avg_rel_std:.2f}% <= 30.0%. Training is stable.")
+
     # 95% Confidence Interval: 1.96 * (std / sqrt(N))
     stderr = std_rewards / math.sqrt(n_seeds)
     ci95 = 1.96 * stderr
@@ -230,12 +318,13 @@ def compute_statistics_and_plot(seeds_data: Dict[int, Tuple[List[int], List[floa
     # Save aggregated statistics CSV
     with open("5seed_500k_aggregated.csv", "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["global_step", "mean_reward", "std_reward", "ci95_lower", "ci95_upper"])
+        writer.writerow(["global_step", "mean_reward", "std_reward", "rel_std_percent", "ci95_lower", "ci95_upper"])
         for i in range(n_points):
             writer.writerow([
                 steps[i],
                 mean_rewards[i],
                 std_rewards[i],
+                rel_std[i] * 100.0,
                 mean_rewards[i] - ci95[i],
                 mean_rewards[i] + ci95[i]
             ])
@@ -284,9 +373,11 @@ def main():
     seeds = [0, 1, 2, 3, 4]
     seeds_data: Dict[int, Tuple[List[int], List[float], List[int]]] = {}
 
-    for s in seeds:
+    for idx, s in enumerate(seeds):
         csv_out = f"5seed_curve_seed{s}.csv"
-        steps, rewards, rules = train_single_seed_500k(seed=s, total_steps=args.steps, csv_out=csv_out)
+        steps, rewards, rules = train_single_seed_500k(
+            seed=s, total_steps=args.steps, csv_out=csv_out, seed_idx=idx, total_seeds=len(seeds)
+        )
         seeds_data[s] = (steps, rewards, rules)
 
     compute_statistics_and_plot(seeds_data)

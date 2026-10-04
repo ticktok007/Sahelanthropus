@@ -6,7 +6,8 @@ Sweep Specification:
   learning_rate in {1e-4, 3e-4}
   num_steps in {256, 512}
   clip_coef in {0.1, 0.2}
-  8 Configurations x 2 Seeds (seed=0, seed=1) = 16 Runs Total
+  gae_lambda in {0.9, 0.95}
+  16 Configurations x 2 Seeds (seed=0, seed=1) = 32 Runs Total
 """
 
 import csv
@@ -35,18 +36,20 @@ def run_grid_sweep():
     learning_rates = [1e-4, 3e-4]
     num_steps_options = [256, 512]
     clip_coefs = [0.1, 0.2]
+    gae_lambdas = [0.9, 0.95]
     seeds = [0, 1]
 
     configs = []
     for lr in learning_rates:
         for ns in num_steps_options:
             for clip in clip_coefs:
-                configs.append({"lr": lr, "num_steps": ns, "clip_coef": clip})
+                for lam in gae_lambdas:
+                    configs.append({"lr": lr, "num_steps": ns, "clip_coef": clip, "gae_lambda": lam})
 
     print("======================================================================")
     print(" WEIGHTS & BIASES HYPERPARAMETER GRID SWEEP")
     print("======================================================================")
-    print(f" Configurations : {len(configs)} (lr in {learning_rates}, ns in {num_steps_options}, clip in {clip_coefs})")
+    print(f" Configurations : {len(configs)} (lr in {learning_rates}, ns in {num_steps_options}, clip in {clip_coefs}, lam in {gae_lambdas})")
     print(f" Seeds Per Config: {seeds}")
     print(f" Total Runs     : {len(configs) * len(seeds)} runs (100,000 steps per run)")
     print("======================================================================\n")
@@ -61,7 +64,8 @@ def run_grid_sweep():
         lr = cfg["lr"]
         ns = cfg["num_steps"]
         clip = cfg["clip_coef"]
-        cfg_key = f"lr{lr}_ns{ns}_clip{clip}"
+        lam = cfg["gae_lambda"]
+        cfg_key = f"lr{lr}_ns{ns}_clip{clip}_lam{lam}"
         group_name = f"sweep_{cfg_key}"
         config_histories[cfg_key] = {}
 
@@ -76,7 +80,8 @@ def run_grid_sweep():
                 num_envs=4,
                 num_steps=ns,
                 lr=lr,
-                clip_coef=clip
+                clip_coef=clip,
+                gae_lambda=lam
             )
 
             res = trainer.train_benchmark_100k(
@@ -94,6 +99,7 @@ def run_grid_sweep():
                 "learning_rate": lr,
                 "num_steps": ns,
                 "clip_coef": clip,
+                "gae_lambda": lam,
                 "seed": seed,
                 "run_tag": run_tag,
                 "group_name": group_name,
@@ -106,7 +112,7 @@ def run_grid_sweep():
     # Compute Group Summaries across 2 seeds per config
     summary_list = []
     for cfg in configs:
-        cfg_key = f"lr{cfg['lr']}_ns{cfg['num_steps']}_clip{cfg['clip_coef']}"
+        cfg_key = f"lr{cfg['lr']}_ns{cfg['num_steps']}_clip{cfg['clip_coef']}_lam{cfg['gae_lambda']}"
         s0_final_ev = config_histories[cfg_key][0][-1]["explained_variance"]
         s1_final_ev = config_histories[cfg_key][1][-1]["explained_variance"]
         ev_mean = float(np.mean([s0_final_ev, s1_final_ev]))
@@ -122,6 +128,7 @@ def run_grid_sweep():
             "lr": cfg["lr"],
             "num_steps": cfg["num_steps"],
             "clip_coef": cfg["clip_coef"],
+            "gae_lambda": cfg["gae_lambda"],
             "ev_mean": ev_mean,
             "ev_std": ev_std,
             "rew_mean": rew_mean,
@@ -134,14 +141,14 @@ def run_grid_sweep():
     print("\n======================================================================")
     print(" W&B SWEEP LEADERBOARD (Ranked by Mean Explained Variance)")
     print("======================================================================")
-    print(f"{'Rank':<5} | {'Config Key':<25} | {'ExplVar (Mean ± Std)':<22} | {'Reward (Mean ± Std)':<22}")
-    print("-" * 80)
+    print(f"{'Rank':<5} | {'Config Key':<32} | {'ExplVar (Mean ± Std)':<22} | {'Reward (Mean ± Std)':<22}")
+    print("-" * 85)
     for rank, item in enumerate(summary_list, start=1):
-        print(f"{rank:<5} | {item['config_key']:<25} | {item['ev_mean']:+.4f} ± {item['ev_std']:.4f}        | {item['rew_mean']:+.4f} ± {item['rew_std']:.4f}")
+        print(f"{rank:<5} | {item['config_key']:<32} | {item['ev_mean']:+.4f} ± {item['ev_std']:.4f}        | {item['rew_mean']:+.4f} ± {item['rew_std']:.4f}")
     print("======================================================================\n")
 
     # Save CSV & JSON
-    fieldnames = ["config_key", "learning_rate", "num_steps", "clip_coef", "seed", "run_tag", "group_name",
+    fieldnames = ["config_key", "learning_rate", "num_steps", "clip_coef", "gae_lambda", "seed", "run_tag", "group_name",
                   "final_explained_variance", "max_explained_variance", "init_explained_variance"]
     with open(SWEEP_CSV_LOG, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -159,7 +166,7 @@ def run_grid_sweep():
 
 def plot_sweep_comparison(config_histories, summary_list, output_png):
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle("W&B PPO Hyperparameter Grid Sweep (8 Configs x 2 Seeds = 16 Runs)\nlr in {1e-4, 3e-4} | n_steps in {256, 512} | clip_coef in {0.1, 0.2}", fontsize=15, fontweight="bold")
+    fig.suptitle("W&B PPO Hyperparameter Grid Sweep (16 Configs x 2 Seeds = 32 Runs)\nlr in {1e-4, 3e-4} | n_steps in {256, 512} | clip_coef in {0.1, 0.2} | lambda in {0.9, 0.95}", fontsize=15, fontweight="bold")
 
     colors = plt.cm.tab10(np.linspace(0, 1, len(summary_list)))
 

@@ -159,11 +159,12 @@ def generate_diverse_corpus() -> List[Dict[str, Any]]:
 
 class PPOFixedBenchmarkTrainer(PPOSuperoptTrainer):
 
-    def __init__(self, num_envs: int = 4, num_steps: int = 512, lr: float = 3e-4, clip_coef: float = 0.2):
-        super().__init__(num_envs=num_envs, num_steps=num_steps, lr=lr, clip_coef=clip_coef)
+    def __init__(self, num_envs: int = 4, num_steps: int = 512, lr: float = 3e-4, clip_coef: float = 0.2, gae_lambda: float = 0.95):
+        super().__init__(num_envs=num_envs, num_steps=num_steps, lr=lr, clip_coef=clip_coef, gae_lambda=gae_lambda)
 
         self.lr = lr
         self.clip_coef = clip_coef
+        self.gae_lambda = gae_lambda
         self.optimizer = optim.Adam(self.agent.parameters(), lr=lr, eps=1e-5)
         self.vf_coef = 0.5
 

@@ -31,6 +31,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def make_env(env_id: str, seed: int) -> Callable[[], gym.Env]:
     def thunk():
         env = gym.make(env_id)
+        env.unwrapped.use_graph_obs = False
         env.action_space.seed(seed)
         return env
     return thunk

@@ -36,11 +36,11 @@ class TestAll10Rules(unittest.TestCase):
         self.assertTrue(rule_matches(0, obs))
 
     def test_rule_1_sdiv_power2(self):
-        """Rule 1: sdiv x, 2^k -> srai x, k"""
+        """Rule 1: divu x, 2^k -> srli x, k"""
         prog = [
             [OPCODE_MAP["LI"], 0, 0, REG_MAP["t0"], 64],
             [OPCODE_MAP["LI"], 0, 0, REG_MAP["t1"], 4],
-            [OPCODE_MAP["DIV"], REG_MAP["t0"], REG_MAP["t1"], REG_MAP["t2"], 0]
+            [OPCODE_MAP["DIVU"], REG_MAP["t0"], REG_MAP["t1"], REG_MAP["t2"], 0]
         ] + [[0, 0, 0, 0, 0]] * 5
         obs = np.array(prog, dtype=np.int32).flatten()
         self.assertTrue(rule_matches(1, obs))

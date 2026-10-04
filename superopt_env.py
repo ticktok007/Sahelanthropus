@@ -91,6 +91,9 @@ def parse_assembly_instruction(line: str) -> List[int]:
     elif op_str in ("BEQ", "BNE", "BLT", "BGE", "BLTU", "BGEU") and len(tokens) >= 3:
         rs1 = REG_MAP.get(tokens[1], 0)
         rs2 = REG_MAP.get(tokens[2], 0)
+    elif op_str == "MV" and len(tokens) >= 3:
+        rd = REG_MAP.get(tokens[1], 0)
+        rs1 = REG_MAP.get(tokens[2], 0)
     elif op_str in ("JAL", "J") and len(tokens) >= 2:
         if len(tokens) >= 3:
             rd = REG_MAP.get(tokens[1], 0)

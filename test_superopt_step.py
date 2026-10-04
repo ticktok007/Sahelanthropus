@@ -11,7 +11,7 @@ from superopt_env import SuperoptEnv
 class TestSuperoptStep(unittest.TestCase):
 
     def setUp(self):
-        self.env = SuperoptEnv(corpus_path="corpus.json", max_len=16, num_rules=5)
+        self.env = SuperoptEnv(corpus_path="corpus.json", max_len=16, num_rules=5, use_reward_shaping=False)
 
     def test_reset_info_action_mask(self):
         """Tests that reset() populates info['action_mask'] correctly."""

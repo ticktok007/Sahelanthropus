@@ -27,15 +27,15 @@ class TestFlatMLPPolicyNetwork(unittest.TestCase):
         print(f"\n[*] Model Device: {DEVICE}")
         
         # Check trunk layers
-        trunk_layers = list(self.model.trunk.children())
-        self.assertEqual(len(trunk_layers), 4)
-        self.assertIsInstance(trunk_layers[0], nn.Linear)
-        self.assertEqual(trunk_layers[0].in_features, 80)
-        self.assertEqual(trunk_layers[0].out_features, 256)
+        actor_trunk_layers = list(self.model.actor_trunk.children())
+        self.assertEqual(len(actor_trunk_layers), 4)
+        self.assertIsInstance(actor_trunk_layers[0], nn.Linear)
+        self.assertEqual(actor_trunk_layers[0].in_features, 80)
+        self.assertEqual(actor_trunk_layers[0].out_features, 256)
         
-        self.assertIsInstance(trunk_layers[2], nn.Linear)
-        self.assertEqual(trunk_layers[2].in_features, 256)
-        self.assertEqual(trunk_layers[2].out_features, 256)
+        self.assertIsInstance(actor_trunk_layers[2], nn.Linear)
+        self.assertEqual(actor_trunk_layers[2].in_features, 256)
+        self.assertEqual(actor_trunk_layers[2].out_features, 256)
 
         # Check actor & critic heads
         self.assertEqual(self.model.actor.in_features, 256)
@@ -48,7 +48,7 @@ class TestFlatMLPPolicyNetwork(unittest.TestCase):
         """Verify forward pass tensor dimensions for single & batch inputs"""
         batch_size = 32
         dummy_obs = torch.randn(batch_size, self.obs_dim, device=DEVICE)
-        dummy_mask = torch.ones(batch_size, 10, dtype=torch.bool, device=DEVICE)
+        dummy_mask = torch.ones(batch_size, self.act_dim, dtype=torch.bool, device=DEVICE)
 
         actions, log_probs, entropy, values = self.model.get_action_and_value(dummy_obs, action_mask=dummy_mask)
 
@@ -60,15 +60,15 @@ class TestFlatMLPPolicyNetwork(unittest.TestCase):
     def test_action_masking_penalty(self):
         """Verify -1e9 logit penalty on masked invalid actions"""
         dummy_obs = torch.randn(1, self.obs_dim, device=DEVICE)
-        # Mask out all rules except rule 0
-        mask = torch.tensor([[True, False, False, False, False, False, False, False, False, False]], device=DEVICE)
+        # Mask out all actions except action 0
+        mask = torch.zeros(1, self.act_dim, dtype=torch.bool, device=DEVICE)
+        mask[0, :16] = True
 
-        features = self.model.trunk(dummy_obs)
-        logits = self.model.actor(features)
+        actor_features = self.model.actor_trunk(dummy_obs)
+        logits = self.model.actor(actor_features)
         
         # Apply mask
-        expanded_mask = mask.repeat_interleave(16, dim=-1)
-        masked_logits = torch.where(expanded_mask, logits, torch.tensor(-1e9, device=DEVICE))
+        masked_logits = torch.where(mask, logits, torch.tensor(-1e9, device=DEVICE))
 
         # Check valid actions (0..15) vs invalid actions (16..159)
         self.assertTrue((masked_logits[0, :16] > -1e8).all())

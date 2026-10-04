@@ -57,8 +57,8 @@ class TestGraphRolloutBuffer(unittest.TestCase):
             self.assertEqual(batch.action.shape, (16,))
             self.assertEqual(batch.return_val.shape, (16,))
             
-            masks = batch.action_mask.reshape(-1, 160)
-            self.assertEqual(masks.shape, (16, 160))
+            masks = batch.action_mask.reshape(-1, 250)
+            self.assertEqual(masks.shape, (16, 250))
 
 
 if __name__ == "__main__":
